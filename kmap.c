@@ -165,12 +165,22 @@ static struct file_operations debugfs_fops = {
 };
 
 static void init_scancode_map(void) {
+    char *default_map_copy = NULL;
+
     for (int i = 0; i < SCANCODE_MAP_SIZE; i++)
         scancode_map[i] = i;
 
-    // Don't return error even if register_remap returns -EINVAL
-    if (default_map)
-        register_remap(default_map);
+    if (default_map) {
+        default_map_copy = kstrdup(default_map, GFP_KERNEL);
+        if (!default_map_copy) {
+            pr_warn("Failed to allocate memory for default_map copy. Skip "
+                    "applying default_map.");
+            return;
+        }
+        // Don't return error even if register_remap returns -EINVAL
+        register_remap(default_map_copy);
+        kfree(default_map_copy);
+    }
 }
 
 static int kmap_init(void) {
