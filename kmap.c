@@ -90,6 +90,7 @@ static int register_remap(char *token) {
 
     rest = token;
 
+    spin_lock_irqsave(&scancode_map_lock, flags);
     while ((pair = strsep(&rest, ",")) != NULL) {
         ret = parse_scancode(pair, &src, &dest);
         if (ret) {
@@ -97,13 +98,11 @@ static int register_remap(char *token) {
             continue;
         }
 
-        spin_lock_irqsave(&scancode_map_lock, flags);
         scancode_map[src] = dest;
-        spin_unlock_irqrestore(&scancode_map_lock, flags);
-
         pr_info("Remapped key %lu to %lu.\n", src, dest);
         success_count++;
     }
+    spin_unlock_irqrestore(&scancode_map_lock, flags);
 
     return success_count > 0 ? 0 : -EINVAL;
 }
