@@ -27,8 +27,7 @@ module_param(default_map, charp, 0444);
 MODULE_PARM_DESC(default_map,
                  "Default key mappings in format 'src1:dest1,src2:dest2,...'");
 
-static DEFINE_SPINLOCK(scancode_map_lock);
-static unsigned char scancode_map[SCANCODE_MAP_SIZE];
+static unsigned char __rcu *scancode_map_ptr = NULL;
 
 static struct dentry *debugfs_dir;
 static struct dentry *debugfs_control;
@@ -38,9 +37,10 @@ static int __kprobes swap_scancode(struct kprobe *p, struct pt_regs *regs) {
     unsigned char scancode = regs->si & KBD_SCANCODE_MASK;
     unsigned char status = regs->si & KBD_STATUS_MASK;
 
-    spin_lock(&scancode_map_lock);
-    regs->si = scancode_map[scancode] + status;
-    spin_unlock(&scancode_map_lock);
+    rcu_read_lock();
+    regs->si = rcu_dereference(scancode_map_ptr)[scancode] + status;
+    rcu_read_unlock();
+
     return 0;
 }
 
@@ -84,13 +84,24 @@ static int parse_scancode(char *token, unsigned long *src,
 
 static int register_remap(char *token) {
     int ret, success_count = 0;
-    unsigned long flags;
     unsigned long src, dest;
+    unsigned char *new_scancode_map = NULL;
+    unsigned char *old_scancode_map;
     char *pair, *rest;
 
-    rest = token;
+    new_scancode_map = kmalloc(SCANCODE_MAP_SIZE, GFP_KERNEL);
+    if (!new_scancode_map) {
+        pr_err("Failed to allocate memory for new_scancode_map. Abort updating "
+               "scancode_map\n");
+        return -ENOMEM;
+    }
 
-    spin_lock_irqsave(&scancode_map_lock, flags);
+    rcu_read_lock();
+    old_scancode_map = rcu_dereference(scancode_map_ptr);
+    memcpy(new_scancode_map, old_scancode_map, SCANCODE_MAP_SIZE);
+    rcu_read_unlock();
+
+    rest = token;
     while ((pair = strsep(&rest, ",")) != NULL) {
         ret = parse_scancode(pair, &src, &dest);
         if (ret) {
@@ -98,13 +109,21 @@ static int register_remap(char *token) {
             continue;
         }
 
-        scancode_map[src] = dest;
+        new_scancode_map[src] = dest;
         pr_info("Remapped key %lu to %lu.\n", src, dest);
         success_count++;
     }
-    spin_unlock_irqrestore(&scancode_map_lock, flags);
 
-    return success_count > 0 ? 0 : -EINVAL;
+    if (success_count == 0) {
+        kfree(new_scancode_map);
+        return -EINVAL;
+    }
+
+    rcu_assign_pointer(scancode_map_ptr, new_scancode_map);
+    synchronize_rcu();
+    kfree(old_scancode_map);
+
+    return 0; 
 }
 
 /* assume "src1:dest1,src2:dest2,..." format */
@@ -138,15 +157,21 @@ free:
 }
 
 static int kmap_seq_show(struct seq_file *seq, void *v) {
-    unsigned char val;
+    unsigned char snapshot[SCANCODE_MAP_SIZE];
+    unsigned char *map;
 
-    // each items in map might be stale, but it's okay.
+    rcu_read_lock();
+    map = rcu_dereference(scancode_map_ptr);
+    memcpy(snapshot, map, SCANCODE_MAP_SIZE);
+    rcu_read_unlock();
+
+    // map might be stale, but it's okay.
     for (int i = 0; i < SCANCODE_MAP_SIZE; i++) {
-        val = READ_ONCE(scancode_map[i]);
-        if (i == val)
+        if (i == snapshot[i])
             continue;
-        seq_printf(seq, "%d:%d\n", i, val);
+        seq_printf(seq, "%d:%d\n", i, snapshot[i]);
     }
+
     return 0;
 }
 
@@ -163,41 +188,57 @@ static struct file_operations debugfs_fops = {
     .write = debugfs_write,
 };
 
-static void init_scancode_map(void) {
+static int init_scancode_map(void) {
+    unsigned char *initial_map;
     char *default_map_copy = NULL;
 
+    initial_map = kmalloc(SCANCODE_MAP_SIZE, GFP_KERNEL);
+    if (!initial_map) {
+        pr_err("Failed to allocate memory for initial_map.\n");
+        return -ENOMEM;
+    }
+
     for (int i = 0; i < SCANCODE_MAP_SIZE; i++)
-        scancode_map[i] = i;
+        initial_map[i] = i;
+
+    rcu_assign_pointer(scancode_map_ptr, initial_map);
 
     if (default_map) {
         default_map_copy = kstrdup(default_map, GFP_KERNEL);
         if (!default_map_copy) {
             pr_warn("Failed to allocate memory for default_map copy. Skip "
-                    "applying default_map.");
-            return;
+                    "applying default_map.\n");
+            return 0;
         }
         // Don't return error even if register_remap returns -EINVAL
         register_remap(default_map_copy);
         kfree(default_map_copy);
     }
+
+    return 0;
 }
 
 static int kmap_init(void) {
     int ret = 0;
 
-    init_scancode_map();
+    ret = init_scancode_map();
+    if (ret) {
+        pr_err("Failed to initialize scancode_map\n");
+        return ret;
+    }
 
     /* debugfs */
     debugfs_dir = debugfs_create_dir("kmap", NULL);
     if (!debugfs_dir) {
-        pr_err("failed to create debugfs dir\n");
-        return PTR_ERR(debugfs_dir);
+        pr_err("Failed to create debugfs dir\n");
+        ret = PTR_ERR(debugfs_dir);
+        goto free_scancode_map;
     }
 
     debugfs_control = debugfs_create_file("control", S_IWUSR | S_IRUGO,
                                           debugfs_dir, NULL, &debugfs_fops);
     if (!debugfs_control) {
-        pr_err("failed to create debugfs file\n");
+        pr_err("Failed to create debugfs file\n");
         ret = PTR_ERR(debugfs_control);
         goto free_debugfs_dir;
     }
@@ -213,12 +254,19 @@ static int kmap_init(void) {
 
 free_debugfs_dir:
     debugfs_remove_recursive(debugfs_dir);
+
+free_scancode_map:
+    synchronize_rcu();
+    kfree(rcu_dereference_protected(scancode_map_ptr, 1));
     return ret;
 }
 
 static void kmap_exit(void) {
     debugfs_remove_recursive(debugfs_dir);
     unregister_kprobe(&kp);
+
+    synchronize_rcu();
+    kfree(rcu_dereference_protected(scancode_map_ptr, 1));
     pr_info("kmap unloaded.\n");
     return;
 }
