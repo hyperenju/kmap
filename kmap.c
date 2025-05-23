@@ -218,6 +218,18 @@ static int init_scancode_map(void) {
     return 0;
 }
 
+static void init_debugfs(void) {
+    debugfs_dir = debugfs_create_dir("kmap", NULL);
+    debugfs_control = debugfs_create_file("control", S_IWUSR | S_IRUGO,
+                                          debugfs_dir, NULL, &debugfs_fops);
+    if (IS_ERR(debugfs_dir) || IS_ERR(debugfs_control))
+        pr_warn("debugfs interface unavailable. Use `default_map` module "
+                "parameter for static configuration.\n "
+                "The parameter is read-only, so if you want to change the "
+                "default mapping, please unload once and reload with the "
+                "parameter.\n");
+}
+
 static int kmap_init(void) {
     int ret = 0;
 
@@ -227,35 +239,18 @@ static int kmap_init(void) {
         return ret;
     }
 
-    /* debugfs */
-    debugfs_dir = debugfs_create_dir("kmap", NULL);
-    if (!debugfs_dir) {
-        pr_err("Failed to create debugfs dir\n");
-        ret = PTR_ERR(debugfs_dir);
-        goto free_scancode_map;
-    }
-
-    debugfs_control = debugfs_create_file("control", S_IWUSR | S_IRUGO,
-                                          debugfs_dir, NULL, &debugfs_fops);
-    if (!debugfs_control) {
-        pr_err("Failed to create debugfs file\n");
-        ret = PTR_ERR(debugfs_control);
-        goto free_debugfs_dir;
-    }
-
     ret = register_kprobe(&kp);
     if (ret < 0) {
         pr_err("register_kprobe failed, returned %d\n", ret);
-        goto free_debugfs_dir;
+        goto free;
     }
+
+    init_debugfs();
 
     pr_info("kmap loaded at %s.\n", SYMBOL_NAME);
     return 0;
 
-free_debugfs_dir:
-    debugfs_remove_recursive(debugfs_dir);
-
-free_scancode_map:
+free:
     synchronize_rcu();
     kfree(rcu_dereference_protected(scancode_map_ptr, 1));
     return ret;
