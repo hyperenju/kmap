@@ -32,10 +32,26 @@ static unsigned char __rcu *scancode_map_ptr = NULL;
 static struct dentry *debugfs_dir;
 static struct dentry *debugfs_control;
 
+#define EXTENDED_E0_PREFIX 0xe0
+static atomic_t extended_e0_mode = ATOMIC_INIT(0);
+
 static int __kprobes swap_scancode(struct kprobe *p, struct pt_regs *regs) {
     /* rsi is second argument in x86. */
-    unsigned char scancode = regs->si & KBD_SCANCODE_MASK;
-    unsigned char status = regs->si & KBD_STATUS_MASK;
+    unsigned char raw = regs->si;
+    unsigned char scancode = raw & KBD_SCANCODE_MASK;
+    unsigned char status = raw & KBD_STATUS_MASK;
+
+    /* Skip conversion for E0-prefixed extended scancodes to avoid breaking
+     * complex sequences like Print Screen */
+    if (raw == EXTENDED_E0_PREFIX) {
+        atomic_set(&extended_e0_mode, 1);
+        return 0;
+    }
+
+    if (atomic_read(&extended_e0_mode)) {
+        atomic_set(&extended_e0_mode, 0);
+        return 0;
+    }
 
     rcu_read_lock();
     regs->si = rcu_dereference(scancode_map_ptr)[scancode] + status;
@@ -54,8 +70,9 @@ struct key_definition {
     unsigned char scancode;
 };
 
-/* This table is based on the layout of my laptop.
- * Don't assume this is the  universal scancodes.
+/* This table is based on the layout of my laptop. Don't assume this is the
+ * universal scancodes. Additionally, this module doesn't support extended
+ * scancodes, which consist of multi-byte sequences.
  */
 static const struct key_definition key_table[] = {
     {"esc", 1},        {"f1", 59},
