@@ -27,7 +27,7 @@ sudo insmod kmap.ko
 To load with default mappings:
 
 ```sh
-sudo insmod kmap.ko default_map="58:29,29:58"
+sudo insmod kmap.ko default_map="capslock:leftctrl,leftctrl:capslock,zenhan:esc"
 ```
 
 ## Usage
@@ -41,14 +41,16 @@ Set mappings (format is `scancode_src:scancode_dest,...`):
 
 ### Swap CapsLock (58) and Left Ctrl (29)
 ```sh
-echo "58:29,29:58" > /sys/kernel/debug/kmap/control
+echo "capslock:leftctrl,leftctrl:capslock" > /sys/kernel/debug/kmap/control
 ```
 
 Reset keys to default:
 
 ```sh
-echo "58:58,29:29" > /sys/kernel/debug/kmap/control
+echo "capslock:capslock,leftctrl:leftctrl" > /sys/kernel/debug/kmap/control
 ```
+
+For available keynames, please look at `key_table` in kmap.c.
 
 ## How It Works
 

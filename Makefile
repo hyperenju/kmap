@@ -1,5 +1,5 @@
 obj-m = kmap.o
-DEFAULT_MAP = "29:58,58:29"
+DEFAULT_MAP = "capslock:leftctrl,leftctrl:capslock,zenhan:esc"
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules

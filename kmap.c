@@ -49,42 +49,136 @@ static struct kprobe kp = {
     .pre_handler = swap_scancode,
 };
 
-static int parse_scancode(char *token, unsigned long *src,
-                          unsigned long *dest) {
-    int ret;
-    char *src_str, *dest_str;
+struct key_definition {
+    const char *keyname;
+    unsigned char scancode;
+};
 
-    src_str = strsep(&token, ":");
-    dest_str = token;
-    if (!src_str || !dest_str) {
-        pr_err("Invalid format. Expected 'src:dest'\n");
-        return -EINVAL;
+/* This table is based on the layout of my laptop.
+ * Don't assume this is the  universal scancodes.
+ */
+static const struct key_definition key_table[] = {
+    {"esc", 1},        {"f1", 59},
+    {"f2", 60},        {"f3", 61},
+    {"f4", 62},        {"f5", 63},
+    {"f6", 64},        {"f7", 65},
+    {"f8", 66},        {"f9", 67},
+    {"f10", 68},       {"f11", 87},
+    {"f12", 88},       {"zenhan", 41},
+    {"1", 2},          {"2", 3},
+    {"3", 4},          {"4", 5},
+    {"5", 6},          {"6", 7},
+    {"7", 8},          {"8", 9},
+    {"9", 10},         {"0", 11},
+    {"-", 12},         {"^", 13},
+    {"yen", 125},      {"backspace", 14},
+    {"tab", 15},       {"q", 16},
+    {"w", 17},         {"e", 18},
+    {"r", 19},         {"t", 20},
+    {"y", 21},         {"u", 22},
+    {"i", 23},         {"o", 24},
+    {"p", 25},         {"@", 26},
+    {"[", 27},         {"capslock", 58},
+    {"a", 30},         {"s", 31},
+    {"d", 32},         {"f", 33},
+    {"g", 34},         {"h", 35},
+    {"j", 36},         {"k", 37},
+    {"l", 38},         {";", 39},
+    {"colon", 40},     {"]", 43},
+    {"enter", 28},     {"leftshift", 42},
+    {"z", 44},         {"x", 45},
+    {"c", 46},         {"v", 47},
+    {"b", 48},         {"n", 49},
+    {"m", 50},         {",", 51},
+    {".", 52},         {"/", 53},
+    {"\\", 115},       {"rightshift", 54},
+    {"leftctrl", 29},  {"leftalt", 56},
+    {"muhenkan", 123}, {"space", 57},
+    {"henkan", 121},   {"katakanahiragana", 112},
+};
+
+static int validate_key_table(void) {
+    int error_count = 0;
+
+    for (int i = 0; i < ARRAY_SIZE(key_table); i++) {
+        if (key_table[i].scancode >= SCANCODE_MAP_SIZE) {
+            pr_err(
+                "key_table[%d]: scancode %d out of range [0..%d)\n",
+                i, key_table[i].scancode, SCANCODE_MAP_SIZE);
+            error_count++;
+        }
+
+        if (!key_table[i].keyname || strlen(key_table[i].keyname) == 0) {
+            pr_err("key_table[%d]: invalid keyname\n", i);
+            error_count++;
+        }
     }
 
-    ret = kstrtoul(src_str, 0, src);
-    if (ret) {
-        pr_err("Invalid src value: %s\n", src_str);
-        return ret;
-    }
-
-    ret = kstrtoul(dest_str, 0, dest);
-    if (ret) {
-        pr_err("Invalid dest value: %s\n", dest_str);
-        return ret;
-    }
-
-    if (*src >= SCANCODE_MAP_SIZE || *dest >= SCANCODE_MAP_SIZE) {
-        pr_err("Scan code must be in range 0-%d. Got src=%lu, dest=%lu\n",
-               SCANCODE_MAP_SIZE - 1, *src, *dest);
+    if (error_count > 0) {
+        pr_err("Found %d errors in key_table. Module load aborted\n", error_count);
         return -EINVAL;
     }
 
     return 0;
 }
 
+static int find_scancode_by_keyname(char *keyname) {
+    for (int i = 0; i < ARRAY_SIZE(key_table); i++) {
+        if (strcasecmp(key_table[i].keyname, keyname) == 0) {
+            return key_table[i].scancode;
+        }
+    }
+    return -1;
+}
+
+struct parsed_key_mapping {
+    char *src_str;
+    char *dest_str;
+    unsigned char src_scancode;
+    unsigned char dest_scancode;
+};
+
+static int parse_scancode(char *token, struct parsed_key_mapping *key) {
+    int ret;
+
+    key->src_str = strsep(&token, ":");
+    key->dest_str = token;
+    if (!key->src_str || !key->dest_str) {
+        pr_err("Invalid format. Expected 'src:dest'\n");
+        return -EINVAL;
+    }
+
+    ret = find_scancode_by_keyname(key->src_str);
+    if (ret < 0) {
+        pr_err("Keyname %s not found.\n", key->src_str);
+        return -EINVAL;
+    }
+    key->src_scancode = ret;
+
+    ret = find_scancode_by_keyname(key->dest_str);
+    if (ret < 0) {
+        pr_err("Keyname %s not found.\n", key->dest_str);
+        return -EINVAL;
+    }
+    key->dest_scancode = ret;
+
+    return 0;
+}
+
+static const char *scancode_to_keyname[SCANCODE_MAP_SIZE];
+
+static void init_scancode_to_keyname(void) {
+    for (int i = 0; i < SCANCODE_MAP_SIZE; i++) {
+        scancode_to_keyname[i] = NULL;
+    }
+
+    for (int i = 0; i < ARRAY_SIZE(key_table); i++) {
+        scancode_to_keyname[key_table[i].scancode] = key_table[i].keyname;
+    }
+}
+
 static int register_remap(char *token) {
     int ret, success_count = 0;
-    unsigned long src, dest;
     unsigned char *new_scancode_map = NULL;
     unsigned char *old_scancode_map;
     char *pair, *rest;
@@ -103,14 +197,15 @@ static int register_remap(char *token) {
 
     rest = token;
     while ((pair = strsep(&rest, ",")) != NULL) {
-        ret = parse_scancode(pair, &src, &dest);
+        struct parsed_key_mapping key;
+        ret = parse_scancode(pair, &key);
         if (ret) {
             pr_warn("Skipping invalid mapping: %s\n", pair);
             continue;
         }
 
-        new_scancode_map[src] = dest;
-        pr_info("Remapped key %lu to %lu.\n", src, dest);
+        new_scancode_map[key.src_scancode] = key.dest_scancode;
+        pr_info("Remapped key %s to %s.\n", key.src_str, key.dest_str);
         success_count++;
     }
 
@@ -123,7 +218,7 @@ static int register_remap(char *token) {
     synchronize_rcu();
     kfree(old_scancode_map);
 
-    return 0; 
+    return 0;
 }
 
 /* assume "src1:dest1,src2:dest2,..." format */
@@ -142,6 +237,8 @@ static ssize_t debugfs_write(struct file *file, const char __user *buf,
     }
 
     kbuf[size] = '\0';
+    if (size > 0 && kbuf[size-1] == '\n')
+        kbuf[size-1] = '\0';
 
     ret = register_remap(kbuf);
     if (ret) {
@@ -169,7 +266,13 @@ static int kmap_seq_show(struct seq_file *seq, void *v) {
     for (int i = 0; i < SCANCODE_MAP_SIZE; i++) {
         if (i == snapshot[i])
             continue;
-        seq_printf(seq, "%d:%d\n", i, snapshot[i]);
+
+        const char *src_keyname = scancode_to_keyname[i];
+        const char *dest_keyname = scancode_to_keyname[snapshot[i]];
+        if (src_keyname && dest_keyname)
+            seq_printf(seq, "%s:%s\n", src_keyname, dest_keyname);
+        else
+            seq_printf(seq, "%d:%d\n", i, snapshot[i]);
     }
 
     return 0;
@@ -232,6 +335,12 @@ static void init_debugfs(void) {
 
 static int kmap_init(void) {
     int ret = 0;
+
+    ret = validate_key_table();
+    if (ret < 0)
+        return ret;
+
+    init_scancode_to_keyname();
 
     ret = init_scancode_map();
     if (ret) {
